@@ -1,0 +1,122 @@
+DAY 001 ■ PHASE 1
+Linux Internals — The Engine Under Everything
+
+cgroups · Namespaces · systemd · /proc · /sys
+TODAY'S GOAL: Understand exactly what a 'container' really is at the kernel level — before you ever run Docker.
+TOOLS: [Linux] [systemd] [cgroups] [namespaces] [/proc]
+WHY THIS MATTERS BEFORE ANYTHING ELSE
+When an interviewer asks 'how does Docker work?' — the wrong answer is 'it packages your app.' The right answer
+explains namespaces and cgroups. Every container, every Kubernetes pod, every cloud function is built on two Linux
+kernel primitives: namespaces (isolation) and cgroups (resource limits). Once you understand these, Docker is obvious,
+Kubernetes is logical, and you can debug things others cannot.
+
+PART 1: NAMESPACES — HOW ISOLATION WORKS
+A namespace makes a process think it is the only process on the system — or that it has its own network, its own
+filesystem, its own process tree. The host kernel is shared; only the view is isolated. Linux has 8 namespace types:
+NAMESPACE WHAT IT ISOLATES REAL EXAMPLE
+PID Process IDs — container PID 1 ≠ host PID 1 Your container's nginx is PID 1. Host sees it as PID 4821.
+NET Network interfaces, routing tables, iptables Each container gets its own eth0, own IP address.
+MNT Mount points, filesystem view Container can't see /home/user on the host.
+UTS Hostname, domain name Container has hostname 'myapp', host has 'prod-server-01'.
+IPC POSIX message queues, shared memory Pevents inter-container shared memory attacks.
+USER User/group IDs UID 0 (root) inside container = non-root UID on host.
+CGROUP cgroup filesystem view Container can't see host cgroup hierarchy.
+TIME System clock offsets (kernel 5.6+) Container can have different clock offset.
+
+See namespaces live on your machine right now:
+# List all namespaces on your host
+lsns
+# Output looks like:
+# NS TYPE NPROCS PID USER COMMAND
+# 4026531835 cgroup 185 1 root /sbin/init
+# 4026531836 pid 185 1 root /sbin/init
+# 4026531837 user 185 1 root /sbin/init
+# Each number is a unique inode — the namespace's identity
+# Now run a container and compare:
+docker run -d --name test nginx
+docker inspect test --format '{{.State.Pid}}' # get container PID
+# Let's call it 4821
+ls -la /proc/4821/ns/ # see its namespaces
+# Output — notice DIFFERENT inode numbers = isolated namespaces:
+# lrwxrwxrwx net -> net:[4026532504] ← different from host!
+
+
+# lrwxrwxrwx pid -> pid:[4026532502] ← different from host!
+■ KEY INSIGHT
+A container IS just a regular Linux process. It has a PID on the host. The only difference is that kernel namespaces
+give it a different VIEW of the system. Run 'ps aux' on your host and you will see every container's processes listed
+there. This is why containers start in milliseconds — no VM, no boot sequence, just a process with restricted
+visibility.
+Build a mini-container with ZERO Docker — just kernel tools:
+# unshare creates a process in new namespaces
+# -p = new PID namespace -f = fork --mount-proc = fresh /proc
+sudo unshare -p -f --mount-proc /bin/bash
+# NOW INSIDE the 'container':
+echo $$ # prints 1 — we are PID 1!
+ps aux # only sees THIS shell — perfect isolation
+hostname # still the host's hostname (no -u flag)
+# Exit and try with UTS namespace too:
+sudo unshare -p -f -u --mount-proc /bin/bash
+hostname container-demo # set our own hostname
+hostname # shows: container-demo
+# Open another terminal on host: hostname → still shows original!
+PART 2: CGROUPS — HOW RESOURCE LIMITS WORK
+Namespaces give isolation. cgroups (control groups) give resource limits. Without cgroups, one container could consume
+100% of CPU and starve all others — the 'noisy neighbour' problem. cgroups solve this. Kubernetes resource requests
+and limits are implemented entirely using cgroups under the hood.
+See what Docker sets up for you automatically:
+# Run a container with CPU and memory limits
+docker run -d --name limited --cpus='0.5' --memory='128m' nginx
+# Find the container's PID
+PID=$(docker inspect limited --format '{{.State.Pid}}')
+echo $PID
+# Look at the actual cgroup files Docker created:
+cat /sys/fs/cgroup/cpu/docker/$(docker inspect limited --format
+'{{.Id}}')/cpu.cfs_quota_us
+# Output: 50000 ← 50,000 microseconds out of 100,000 = 50% = 0.5 CPU
+cat /sys/fs/cgroup/memory/docker/$(docker inspect limited --format
+'{{.Id}}')/memory.limit_in_bytes
+# Output: 134217728 ← 128 * 1024 * 1024 = 128MB
+■ CONNECT THE DOTS — Kubernetes Resource Limits
+When you write 'resources: limits: cpu: 500m memory: 128Mi' in a Kubernetes manifest, kubelet translates that
+directly into the same cgroup files you see above. cpu: 500m = 0.5 CPU = 50,000 microseconds quota. This is why
+you need to understand Linux before you can truly debug Kubernetes resource issues
+
+PART 3: systemd — The Init System
+systemd is PID 1 on every modern Linux system. It manages services, dependencies, and — crucially — it uses cgroups
+internally to manage service resource limits. Understanding systemd is essential for debugging services in VMs, cloud
+instances, and bare metal.
+# Key systemd commands you need to know cold:
+systemctl list-units --type=service --state=running # all running services
+systemctl status nginx # detailed status + last logs
+systemctl start|stop|restart|reload nginx # lifecycle
+systemctl enable nginx # start on boot (creates symlink in /etc/systemd/system)
+systemctl disable nginx # remove symlink
+# Investigate a failed service:
+systemctl --failed # list all failed units
+journalctl -u nginx -n 50 --no-pager # last 50 log lines for nginx
+journalctl -u nginx --since '1 hour ago' # time-filtered logs
+journalctl -p err -b # all errors since last boot
+# systemd unit file — this is how services are defined:
+cat /etc/systemd/system/multi-user.target.wants/nginx.service
+PART 4: /proc and /sys — The Kernel's Interface
+/proc is not a real filesystem — it is a virtual interface to the kernel. Every file you read from /proc is generated live by the
+kernel. Senior engineers know this is where you go to get the truth about what is happening.
+# /proc// contains everything about a process:
+cat /proc/1/cmdline | tr '\0' ' ' # full command line of PID 1 (init/systemd)
+cat /proc/self/status # YOUR process's info
+cat /proc/self/maps # memory map of current shell
+cat /proc/meminfo # system memory breakdown
+cat /proc/cpuinfo # CPU details
+cat /proc/net/tcp # all TCP connections (raw hex)
+# /sys/fs/cgroup = cgroup hierarchy (resource management)
+ls /sys/fs/cgroup/ # show all cgroup controllers
+cat /sys/fs/cgroup/memory/memory.stat # system-wide memory stats
+# Read network statistics for debugging:
+cat /proc/net/sockstat # socket summary
+cat /proc/sys/net/core/somaxconn # max socket listen queue
+# Change it live (no restart needed!):
+echo 65535 | sudo tee /proc/sys/net/core/somaxconn
+# Make it permanent:
+echo 'net.core.somaxconn=65535' | sudo tee -a /etc/sysctl.conf
+sudo sysctl -p
