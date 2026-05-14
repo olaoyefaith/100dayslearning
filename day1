@@ -4,6 +4,7 @@ Linux Internals — The Engine Under Everything
 cgroups · Namespaces · systemd · /proc · /sys
 TODAY'S GOAL: Understand exactly what a 'container' really is at the kernel level — before you ever run Docker.
 TOOLS: [Linux] [systemd] [cgroups] [namespaces] [/proc]
+
 WHY THIS MATTERS BEFORE ANYTHING ELSE
 When an interviewer asks 'how does Docker work?' — the wrong answer is 'it packages your app.' The right answer
 explains namespaces and cgroups. Every container, every Kubernetes pod, every cloud function is built on two Linux
@@ -13,6 +14,7 @@ Kubernetes is logical, and you can debug things others cannot.
 PART 1: NAMESPACES — HOW ISOLATION WORKS
 A namespace makes a process think it is the only process on the system — or that it has its own network, its own
 filesystem, its own process tree. The host kernel is shared; only the view is isolated. Linux has 8 namespace types:
+
 NAMESPACE WHAT IT ISOLATES REAL EXAMPLE
 PID Process IDs — container PID 1 ≠ host PID 1 Your container's nginx is PID 1. Host sees it as PID 4821.
 NET Network interfaces, routing tables, iptables Each container gets its own eth0, own IP address.
@@ -24,6 +26,7 @@ CGROUP cgroup filesystem view Container can't see host cgroup hierarchy.
 TIME System clock offsets (kernel 5.6+) Container can have different clock offset.
 
 See namespaces live on your machine right now:
+
 # List all namespaces on your host
 lsns
 # Output looks like:
@@ -39,9 +42,9 @@ docker inspect test --format '{{.State.Pid}}' # get container PID
 ls -la /proc/4821/ns/ # see its namespaces
 # Output — notice DIFFERENT inode numbers = isolated namespaces:
 # lrwxrwxrwx net -> net:[4026532504] ← different from host!
-
-
 # lrwxrwxrwx pid -> pid:[4026532502] ← different from host!
+
+
 ■ KEY INSIGHT
 A container IS just a regular Linux process. It has a PID on the host. The only difference is that kernel namespaces
 give it a different VIEW of the system. Run 'ps aux' on your host and you will see every container's processes listed
@@ -60,6 +63,8 @@ sudo unshare -p -f -u --mount-proc /bin/bash
 hostname container-demo # set our own hostname
 hostname # shows: container-demo
 # Open another terminal on host: hostname → still shows original!
+
+
 PART 2: CGROUPS — HOW RESOURCE LIMITS WORK
 Namespaces give isolation. cgroups (control groups) give resource limits. Without cgroups, one container could consume
 100% of CPU and starve all others — the 'noisy neighbour' problem. cgroups solve this. Kubernetes resource requests
@@ -77,10 +82,13 @@ cat /sys/fs/cgroup/cpu/docker/$(docker inspect limited --format
 cat /sys/fs/cgroup/memory/docker/$(docker inspect limited --format
 '{{.Id}}')/memory.limit_in_bytes
 # Output: 134217728 ← 128 * 1024 * 1024 = 128MB
+
+
 ■ CONNECT THE DOTS — Kubernetes Resource Limits
 When you write 'resources: limits: cpu: 500m memory: 128Mi' in a Kubernetes manifest, kubelet translates that
 directly into the same cgroup files you see above. cpu: 500m = 0.5 CPU = 50,000 microseconds quota. This is why
 you need to understand Linux before you can truly debug Kubernetes resource issues
+
 
 PART 3: systemd — The Init System
 systemd is PID 1 on every modern Linux system. It manages services, dependencies, and — crucially — it uses cgroups
@@ -99,6 +107,8 @@ journalctl -u nginx --since '1 hour ago' # time-filtered logs
 journalctl -p err -b # all errors since last boot
 # systemd unit file — this is how services are defined:
 cat /etc/systemd/system/multi-user.target.wants/nginx.service
+
+
 PART 4: /proc and /sys — The Kernel's Interface
 /proc is not a real filesystem — it is a virtual interface to the kernel. Every file you read from /proc is generated live by the
 kernel. Senior engineers know this is where you go to get the truth about what is happening.
@@ -120,3 +130,42 @@ echo 65535 | sudo tee /proc/sys/net/core/somaxconn
 # Make it permanent:
 echo 'net.core.somaxconn=65535' | sudo tee -a /etc/sysctl.conf
 sudo sysctl -p
+
+
+■ HANDS-ON LAB — Build Isolation From Scratch
+Estimated time: 45 minutes. Do every step. Don't skip.
+■ 1. Run 'lsns' and record the PID namespace inode number for PID 1
+■ 2. Run 'docker run -d --name lab1 nginx' then inspect /proc/$(docker inspect lab1 --format '{{.State.Pid}}')/ns/ — write
+down 3 namespaces that differ from PID 1.
+■ 3. Run 'sudo unshare -p -f --mount-proc bash' — confirm you are PID 1 inside with 'echo $$'. Run 'ps aux' — how many
+processes do you see? Exit.
+■ 4. Run 'sudo unshare -p -f -u --mount-proc bash'. Set hostname to your name. Open a second terminal and confirm the
+host hostname is unchanged.
+■ 5. Run 'docker run -d --name mem-test --memory=50m stress stress --vm 1 --vm-bytes 100M'. Watch it get OOMKilled:
+'docker stats mem-test' for 10 seconds.
+■ 6. Read the OOM kill from the kernel: 'dmesg | grep -i oom | tail -5'. This is what you will do in production when pods die
+mysteriously.
+■ 7. Run 'systemctl list-units --type=service --failed'. If any are failed, read the logs with journalctl -u -n 20.
+■ 8. Read /proc/self/status. Find your process's VmRSS (resident memory). Find your UID and GID.
+■ 9. COMMIT: Create a file named 'day1-notes.md'. Write 3 sentences explaining namespaces and 3 sentences explaining
+cgroups in your own words. Push to GitHub.
+■ DAY 1 KNOWLEDGE CHECKLIST
+■ I can explain the difference between namespaces (isolation) and cgroups (limits) without looking at notes
+■ I can list 6 of the 8 Linux namespace types and what each isolates
+■ I can find the namespace inodes of any running process using /proc//ns/
+■ I can create an isolated process using unshare
+■ I can read and modify a kernel parameter via /proc/sys/
+■ I can use systemctl and journalctl to inspect service status and logs
+■ I understand WHY Docker containers start in milliseconds (no VM boot, just a process)
+
+■ INTERVIEW QUESTIONS FOR DAY 1
+Practice answering each of these out loud for 2 minutes:
+Q: What is the difference between a container and a virtual machine?
+A direction: VMs virtualise hardware (full OS, hypervisor, slow boot). Containers virtualise at the OS level using
+namespaces+cgroups — they share the host kernel, are just processes, start in ms.
+Q: How does Kubernetes enforce memory limits on pods?
+A direction: kubelet writes the limit value to /sys/fs/cgroup/memory//memory.limit_in_bytes. The kernel's OOM killer
+enforces it.
+Q: A pod is being OOMKilled. What do you do first?
+A direction: kubectl describe pod → look at OOMKilled in Last State. Check limits. dmesg or kernel logs for oom_kill.
+Consider raising memory limit or fixing memory leak.
